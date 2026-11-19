@@ -1,6 +1,8 @@
-# CLM
+<p align="center">
+  <img src="logo.svg" alt="CLM" width="452">
+</p>
 
-CLM is a keyboard-driven terminal launcher for Claude Code. Browse local projects, search chats, and open a new or existing session in the selected folder.
+<p align="center">A keyboard-driven terminal launcher for Claude Code.<br>Browse local projects, search chats, and open a new or existing session in the selected folder.</p>
 
 ## Requirements
 
@@ -12,14 +14,14 @@ CLM is a keyboard-driven terminal launcher for Claude Code. Browse local project
 One line, no clone needed:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Sl0oth/clm/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Sl0oth/claude-menu/main/install.sh | sh
 ```
 
 Or from a clone (updates with `git pull`):
 
 ```sh
-git clone https://github.com/Sl0oth/clm.git
-cd clm
+git clone https://github.com/Sl0oth/claude-menu.git
+cd claude-menu
 ./install.sh
 ```
 

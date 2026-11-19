@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-SOURCE_URL="https://raw.githubusercontent.com/Sl0oth/clm/main/clm"
+SOURCE_URL="https://raw.githubusercontent.com/Sl0oth/claude-menu/main/clm"
 BIN_DIR="${CLM_BIN_DIR:-$HOME/.local/bin}"
 TARGET="$BIN_DIR/clm"
 
