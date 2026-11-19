@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+
+import curses
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime
+from functools import lru_cache
+from pathlib import Path
+
+
+WORDMARK = (
+    (" ╭──────╮", "╭─╮",      "╭─╮    ╭─╮"),
+    ("╭╯ ╭────╯", "│ │",      "│  ╲  ╱  │"),
+    ("│  │",      "│ │",      "│ │╲╲╱╱│ │"),
+    ("╰╮ ╰────╮", "│ ╰────╮", "│ │ ╲╱ │ │"),
+    (" ╰──────╯", "╰──────╯", "╰─╯    ╰─╯"),
+)
+
+
+@dataclass(frozen=True)
+class Chat:
+    session_id: str
+    title: str
+    preview: str
+    modified: float
+
+
+def plain(value):
+    if not isinstance(value, str):
+        return ""
+    return " ".join("".join(c for c in value if c.isprintable() or c.isspace()).split())
+
+
+def records(lines):
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+        if isinstance(entry, dict):
+            yield entry
+
+
+def read_chat(path):
+    try:
+        session_id = str(uuid.UUID(path.stem))
+        stat = path.stat()
+        with path.open("rb") as transcript:
+            head = transcript.read(256 * 1024).split(b"\n")[:-1]
+            tail_start = max(0, stat.st_size - 128 * 1024)
+            transcript.seek(tail_start)
+            if tail_start:
+                transcript.readline()
+            tail = transcript.read(128 * 1024).splitlines()
+    except (ValueError, OSError):
+        return None
+
+    cwd = preview = title = ""
+    for entry in records(head):
+        if entry.get("type") != "user" or entry.get("sessionId") != session_id:
+            continue
+        if entry.get("isMeta") or entry.get("isSidechain"):
+            continue
+        message = entry.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            content = " ".join(
+                plain(block.get("text")) for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        current_dir = entry.get("cwd")
+        if isinstance(current_dir, str) and Path(current_dir).is_absolute():
+            cwd = cwd or current_dir
+        candidate = plain(content)
+        if candidate and not candidate.startswith("<"):
+            candidate = plain(re.sub(r"</?pasted_content[^>]*>", " ", candidate))
+            preview = candidate
+            if cwd:
+                break
+    if not cwd:
+        return None
+    for entry in records(head + tail):
+        if entry.get("type") == "custom-title" and entry.get("sessionId") == session_id:
+            title = plain(entry.get("customTitle")) or title
+    try:
+        folder = Path(cwd).resolve()
+        if not folder.is_dir():
+            return None
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return folder, Chat(session_id, title or preview or "Untitled chat", preview, stat.st_mtime)
+
+
+def catalog():
+    home = Path.home()
+    dev = home / "Documents" / "Dev"
+    config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(home / ".claude"))).expanduser()
+    projects = {}
+    utility_folders = {".gradle", ".git", "gradle", "manifest", "manifests",
+                       "build", "node_modules", "__pycache__"}
+    if dev.is_dir():
+        for folder in dev.iterdir():
+            if not folder.name.startswith(".") and folder.name.casefold() not in utility_folders and folder.is_dir():
+                projects[folder.resolve()] = {}
+    for transcript in (config / "projects").glob("*/*.jsonl"):
+        result = read_chat(transcript)
+        if result is None:
+            continue
+        folder, chat = result
+        chats = projects.setdefault(folder, {})
+        previous = chats.get(chat.session_id)
+        if previous is None or previous.modified < chat.modified:
+            chats[chat.session_id] = chat
+    videos = (home / "Documents" / "Videos").resolve()
+    if any(videos in folder.parents for folder in projects):
+        projects.setdefault(videos, {})
+    ordered = [
+        (folder, sorted(chats.values(), key=lambda chat: -chat.modified))
+        for folder, chats in projects.items()
+    ]
+    return sorted(ordered, key=lambda item: (
+        -item[1][0].modified if item[1] else 0,
+        item[0].name.casefold(),
+        str(item[0]),
+    ))
+
+
+def shorten(path):
+    try:
+        return "~/" + str(path.relative_to(Path.home()))
+    except ValueError:
+        return str(path)
+
+
+def clipped(value, limit):
+    return value if len(value) <= limit else value[:max(0, limit - 1)] + "…"
+
+
+AGES = ((31536000, "y", "year"), (2592000, "mo", "month"), (604800, "w", "week"),
+        (86400, "d", "day"), (3600, "h", "hour"), (60, "m", "minute"))
+
+
+def ago(stamp, long=False):
+    seconds = max(0, time.time() - stamp)
+    for size, short, word in AGES:
+        if seconds >= size:
+            count = int(seconds // size)
+            return f"{count} {word}{'s' * (count != 1)} ago" if long else f"{count}{short}"
+    return "just now" if long else "now"
+
+
+def heat(stamp):
+    if stamp is None:
+        return "dim"
+    age = time.time() - stamp
+    return "new" if age < 86400 else "old" if age < 604800 else "dim"
+
+
+@lru_cache(maxsize=None)
+def git_branch(folder):
+    try:
+        head = (folder / ".git" / "HEAD").read_text().strip()
+    except (OSError, UnicodeError):
+        return ""
+    return head.removeprefix("ref: refs/heads/") if head.startswith("ref:") else head[:7]
+
+
+def browse(screen, projects, folder, error):
+    curses.set_escdelay(25)
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    C = {"text": 0, "title": curses.A_BOLD, "dim": curses.A_DIM, "accent": curses.A_BOLD,
+         "sel": curses.A_REVERSE, "border": curses.A_DIM, "new": 0, "old": 0,
+         "err": curses.A_BOLD, "bar": curses.A_REVERSE, "key": curses.A_REVERSE | curses.A_BOLD}
+    if curses.has_colors() and curses.COLORS >= 256:
+        palette = {"text": (252, 236), "title": (255, 236), "dim": (244, 236), "accent": (141, 236),
+                   "sel": (255, 54), "border": (240, 236), "new": (114, 236), "old": (179, 236),
+                   "err": (210, 236), "bar": (250, 238), "key": (141, 238)}
+        for number, (name, (fg, bg)) in enumerate(palette.items(), 1):
+            curses.init_pair(number, fg, bg)
+            C[name] = curses.color_pair(number)
+        for name in ("title", "accent", "err", "key"):
+            C[name] |= curses.A_BOLD
+
+    selected = offset = 0
+    query, focus = "", None
+    dev_root = (Path.home() / "Documents" / "Dev").resolve()
+    chats_by_folder = dict(projects)
+    parent_of = {
+        project: next((parent for parent in project.parents
+                       if parent in chats_by_folder and parent != dev_root), None)
+        for project in chats_by_folder
+    }
+    children = {}
+    for project, parent in parent_of.items():
+        children.setdefault(parent, []).append(project)
+    roots = [p for p in children.get(None, []) if chats_by_folder[p] or children.get(p)]
+    total_chats = sum(map(len, chats_by_folder.values()))
+
+    def put(y, x, text, attr=None, limit=None):
+        height, width = screen.getmaxyx()
+        room = width - x if limit is None else min(width - x, limit)
+        if not (0 <= y < height and x >= 0 and room > 0):
+            return x
+        text = clipped(text, room)
+        try:
+            screen.addnstr(y, x, text, room, C["text"] if attr is None else attr)
+        except curses.error:
+            pass
+        return x + len(text)
+
+    def segments(y, x, parts, limit):
+        end = x + limit
+        for text, attr in parts:
+            if x >= end:
+                break
+            x = put(y, x, text, attr, end - x)
+        return x
+
+    def box(top, left, bottom, width, title=""):
+        put(top, left, "╭" + "─" * (width - 2) + "╮", C["border"])
+        for y in range(top + 1, bottom):
+            put(y, left, "│", C["border"])
+            put(y, left + width - 1, "│", C["border"])
+        put(bottom, left, "╰" + "─" * (width - 2) + "╯", C["border"])
+        if title:
+            put(top, left + 2, f" {title} ", C["accent"])
+
+    def count(n, word):
+        return f"{n} {word}{'s' * (n != 1)}"
+
+    def draw_row(y, x, width, row, active):
+        kind, item, title, _ = row
+        look = (lambda name: C["sel"]) if active else (lambda name: C[name])
+        if kind == "new":
+            put(y, x, "+  New chat", look("accent"))
+            return
+        if kind == "folder":
+            chats = chats_by_folder[item]
+            stamp = chats[0].modified if chats else None
+            right = count(len(chats), "chat") + (f"  {ago(stamp):>3}" if stamp else "     ")
+            room = width - len(right) - 4
+            label, tone = clipped(plain(title), room - 1) + "/", "text" if chats else "dim"
+        else:
+            stamp, right = item.modified, ago(item.modified)
+            room = width - len(right) - 4
+            label, tone = clipped(plain(title), room), "text"
+        put(y, x, "●" if stamp else "○", look(heat(stamp)))
+        put(y, x + 2, label, look(tone))
+        put(y, x + width - len(right), right, look("dim"))
+
+    def details(row, width, room):
+        kind, item = row[:2]
+        blank = []
+
+        def wrap(text, attr, most=None):
+            lines = textwrap.wrap(text, width)
+            if most is not None and len(lines) > most:
+                lines = lines[:most]
+                lines[-1] = clipped(lines[-1] + " …", width)
+            return [[(line, attr)] for line in lines]
+
+        if kind == "new":
+            return [[("New chat", C["title"])], [(shorten(folder), C["dim"])], blank,
+                    *wrap("Start a fresh Claude Code session in this folder.", C["text"])], "start a new chat"
+        if kind == "chat":
+            named = item.title != item.preview
+            when = datetime.fromtimestamp(item.modified).strftime("%a %b %d, %H:%M")
+            lines = [*wrap(item.title, C["title"], 3 if named else max(3, room - 3)),
+                     [(ago(item.modified, True), C["text"]), ("  ·  " + when, C["dim"])],
+                     [("session  " + item.session_id, C["dim"])]]
+            if named and item.preview:
+                lines += [blank, [("First message", C["accent"])],
+                          *wrap(item.preview, C["text"], max(1, room - len(lines) - 2))]
+            return lines, "resume this chat"
+        chats, subs = chats_by_folder[item], children.get(item, [])
+        facts = [("Chats", str(len(chats)))]
+        if chats:
+            facts.append(("Last active", ago(chats[0].modified, True)))
+        if git_branch(item):
+            facts.append(("Branch", git_branch(item)))
+        if subs:
+            facts.append(("Folders", ", ".join(sub.name for sub in subs)))
+        lines = [[(item.name, C["title"])], [(shorten(item), C["dim"])], blank,
+                 *[[(f"{name:<13}", C["dim"]), (value, C["text"])] for name, value in facts], blank]
+        if not chats:
+            return lines + [[("No chats yet.", C["dim"])]], "open"
+        lines.append([("Recent chats", C["accent"])])
+        for chat in chats:
+            right = ago(chat.modified)
+            room = width - len(right) - 3
+            lines.append([("● ", C[heat(chat.modified)]),
+                          (clipped(plain(chat.title), room).ljust(room + 1), C["text"]), (right, C["dim"])])
+        return lines, "open"
+
+    while True:
+        screen.erase()
+        height, width = screen.getmaxyx()
+        if C["text"]:
+            for y in range(height):
+                screen.hline(y, 0, " ", width - (y == height - 1), C["text"])
+        if folder is None:
+            candidates = chats_by_folder if query else roots
+            rows = [("folder", p, p.name, shorten(p)) for p in candidates]
+        else:
+            rows = [("new", None, "New chat", "")]
+            rows += [("folder", p, str(p.relative_to(folder)), shorten(p)) for p in children.get(folder, [])]
+            rows += [("chat", c, c.title, c.preview) for c in chats_by_folder.get(folder, [])]
+        needle = query.casefold()
+        rows = [row for row in rows if needle in (row[2] + " " + row[3]).casefold()]
+        if focus is not None:
+            selected = next((i for i, row in enumerate(rows) if row[1] == focus), 0)
+            focus = None
+        selected = min(selected, max(0, len(rows) - 1))
+
+        margin = 2 if width >= 60 else 0
+        inner = width - 2 * margin
+        trail, step = [], folder
+        while step is not None:
+            trail.append(step.name)
+            step = parent_of.get(step)
+        crumbs = [("Projects", C["dim"] if trail else C["title"])]
+        for index, name in enumerate(reversed(trail), 1):
+            crumbs += [("  ›  ", C["accent"]), (name, C["title"] if index == len(trail) else C["dim"])]
+        if folder is None:
+            stats = f"{count(len(roots), 'project')}  ·  {count(total_chats, 'chat')}"
+        else:
+            stats = count(len(chats_by_folder[folder]), "chat")
+            if children.get(folder):
+                stats += "  ·  " + count(len(children[folder]), "folder")
+        if height >= 22 and width >= 64:
+            top = 1 if height >= 26 else 0
+            for y, (c, l, m) in enumerate(WORDMARK, top):
+                put(y, margin + 1, f"{c:<12}{l:<11}{m}", C["accent"])
+            info = margin + 38
+            segments(top + 1, info, crumbs, width - info - margin)
+            put(top + 2, info, shorten(folder or dev_root), C["dim"])
+            put(top + 3, info, stats, C["dim"])
+            search = top + 6
+        else:
+            x = put(0, margin, "◈ clm   ", C["accent"])
+            segments(0, x, crumbs + [("   " + stats, C["dim"])], width - x - margin)
+            search = 1
+
+        box(search, margin, search + 2, inner)
+        x = put(search + 1, margin + 2, "› ", C["accent"])
+        if query:
+            found = count(len(rows), "match").replace("matchs", "matches")
+            x = put(search + 1, x, query, C["title"], inner - len(found) - 8)
+            put(search + 1, x, "▏", C["accent"])
+            put(search + 1, margin + inner - 2 - len(found), found, C["dim"])
+        else:
+            put(search + 1, x, "Type to search " + ("projects" if folder is None else "folders and chats"),
+                C["dim"], inner - 6)
+
+        top, bottom = search + 3, max(search + 5, height - 3)
+        split = inner >= 96
+        list_width = max(44, inner * 9 // 20) if split else inner
+        visible = bottom - top - 1
+        offset = min(offset, selected, max(0, len(rows) - visible))
+        offset = max(offset, selected - visible + 1)
+        box(top, margin, bottom, list_width, "Projects" if folder is None else "Chats")
+        for index, row in enumerate(rows[offset:offset + visible], offset):
+            y = top + 1 + index - offset
+            if index == selected:
+                put(y, margin + 1, " " * (list_width - 2), C["sel"])
+            draw_row(y, margin + 2, list_width - 4, row, index == selected)
+        if not rows:
+            put(top + 1, margin + 2, "No matches" if query else "Type to find a Dev folder and start a chat",
+                C["dim"], list_width - 4)
+        if len(rows) > visible:
+            thumb = max(1, visible * visible // len(rows))
+            start = offset * (visible - thumb) // (len(rows) - visible)
+            for y in range(top + 1 + start, top + 1 + start + thumb):
+                put(y, margin + list_width - 1, "┃", C["accent"])
+        if split:
+            left, panel = margin + list_width + 1, inner - list_width - 1
+            box(top, left, bottom, panel, "Details")
+            if rows:
+                lines, action = details(rows[selected], panel - 4, visible - 2)
+                for y, parts in enumerate(lines[:max(0, visible - 2)], top + 1):
+                    segments(y, left + 2, parts, panel - 4)
+                segments(bottom - 1, left + 2, [("⏎ ", C["accent"]), ("Enter", C["text"]),
+                                                (" to " + action, C["dim"])], panel - 4)
+
+        if error:
+            put(height - 2, margin + 1, error, C["err"])
+        elif rows and not split and rows[selected][3] != rows[selected][2]:
+            put(height - 2, margin + 1, plain(rows[selected][3]), C["dim"], inner - 2)
+        try:
+            screen.hline(height - 1, 0, " ", width, C["bar"])
+        except curses.error:
+            pass
+        escape = "clear" if query else "back" if folder is not None else "quit"
+        x = margin + 1
+        hints = [("↑↓", "move"), ("⏎", "open"), ("esc", escape)] + [("^C", "quit")] * (escape != "quit")
+        for key_name, label in hints:
+            x = put(height - 1, x, f" {key_name} ", C["key"])
+            x = put(height - 1, x, f" {label}   ", C["bar"])
+        if rows:
+            position = f"{selected + 1} / {len(rows)}"
+            put(height - 1, width - margin - 1 - len(position), position, C["bar"])
+        screen.refresh()
+
+        key = screen.get_wch()
+        error = ""
+        if key == curses.KEY_UP:
+            selected = max(0, selected - 1)
+        elif key == curses.KEY_DOWN:
+            selected = min(max(0, len(rows) - 1), selected + 1)
+        elif key == curses.KEY_PPAGE:
+            selected = max(0, selected - visible)
+        elif key == curses.KEY_NPAGE:
+            selected = min(max(0, len(rows) - 1), selected + visible)
+        elif key in ("\n", "\r", curses.KEY_ENTER):
+            if not rows:
+                continue
+            kind, choice = rows[selected][:2]
+            if kind in ("new", "chat"):
+                return folder, choice
+            folder = choice
+            selected, offset, query = 0, 0, ""
+        elif key == "\x1b":
+            if query:
+                selected, offset, query = 0, 0, ""
+            elif folder is not None:
+                focus, folder = folder, parent_of.get(folder)
+                offset = 0
+            else:
+                return None
+        elif key == "/" and not query:
+            continue
+        elif key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+            query = query[:-1]
+            selected = 0
+        elif isinstance(key, str) and key.isprintable():
+            query += key
+            selected = 0
+
+
+def main():
+    if sys.argv[1:] in (["--help"], ["-h"]):
+        print("clm — browse local Claude Code projects and chats\n"
+              "Type to search · ↑↓ move · Enter open · Esc clear / back · Ctrl-C quit")
+        return 0
+    if sys.argv[1:]:
+        print("Usage: clm", file=sys.stderr)
+        return 2
+    claude = shutil.which("claude")
+    if claude is None or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("Run clm in a terminal with Claude Code on your PATH.", file=sys.stderr)
+        return 1
+
+    folder, error = None, ""
+    try:
+        while True:
+            choice = curses.wrapper(browse, catalog(), folder, error)
+            if choice is None:
+                return 0
+            folder, chat = choice
+            command = [claude, "--resume", chat.session_id] if chat else [claude]
+            try:
+                result = subprocess.run(command, cwd=folder, check=False)
+                error = f"Claude Code exited with status {result.returncode}." if result.returncode else ""
+            except KeyboardInterrupt:
+                error = ""
+            except OSError as exc:
+                error = plain(str(exc))
+    except KeyboardInterrupt:
+        return 130
+    except (curses.error, OSError) as exc:
+        print(f"Could not open clm: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
