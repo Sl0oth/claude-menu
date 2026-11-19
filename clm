@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 
-import curses
 import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import textwrap
@@ -16,6 +16,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
+
+try:
+    import curses
+except ImportError:
+    curses = None
 
 
 WORDMARK = (
@@ -108,8 +113,14 @@ def catalog(root):
                        "build", "node_modules", "__pycache__"}
     try:
         for folder in root.iterdir():
-            if not folder.name.startswith(".") and folder.name.casefold() not in utility_folders and folder.is_dir():
+            if folder.name.startswith(".") or folder.name.casefold() in utility_folders:
+                continue
+            try:
+                if getattr(folder.lstat(), "st_file_attributes", 0) & 6 or not folder.is_dir():
+                    continue
                 projects[folder.resolve()] = {}
+            except (OSError, RuntimeError):
+                continue
     except OSError:
         pass
     for transcript in (config / "projects").glob("*/*.jsonl"):
@@ -136,7 +147,7 @@ def catalog(root):
 
 def shorten(path):
     try:
-        return "~/" + str(path.relative_to(Path.home()))
+        return str(Path("~") / path.relative_to(Path.home()))
     except ValueError:
         return str(path)
 
@@ -176,16 +187,33 @@ def git_branch(folder):
 
 UPDATE_URL = "https://raw.githubusercontent.com/Sl0oth/claude-menu/main/clm"
 HERE = Path(__file__).resolve()
-CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "clm" / "update.json"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME") or os.environ.get("LOCALAPPDATA") or Path.home() / ".cache") / "clm" / "update.json"
 
 
 def from_git():
     return (HERE.parent / ".git").exists()
 
 
+def program(name):
+    if os.name != "nt":
+        return shutil.which(name)
+    extensions = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if e]
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        folder = folder.strip('"')
+        if folder and os.path.isabs(folder):
+            for extension in extensions:
+                candidate = os.path.join(folder, name + extension)
+                if os.path.isfile(candidate):
+                    return candidate
+    return None
+
+
 def fetch_latest():
+    curl = program("curl")
+    if curl is None:
+        return None
     try:
-        result = subprocess.run(["curl", "-fsSL", "--max-time", "8", UPDATE_URL],
+        result = subprocess.run([curl, "-fsSL", "--max-time", "8", UPDATE_URL],
                                 capture_output=True, check=False)
     except OSError:
         return None
@@ -231,7 +259,11 @@ def watch_for_update(state):
 def update_self():
     if from_git():
         print(f"clm runs from a git clone at {shorten(HERE.parent)}, updating with git pull.", flush=True)
-        return subprocess.run(["git", "-C", str(HERE.parent), "pull", "--ff-only"], check=False).returncode
+        git = program("git")
+        if git is None:
+            print("git is not on your PATH.", file=sys.stderr)
+            return 1
+        return subprocess.run([git, "-C", str(HERE.parent), "pull", "--ff-only"], check=False).returncode
     latest = fetch_latest()
     if latest is None:
         print("Could not download the latest clm.", file=sys.stderr)
@@ -254,7 +286,10 @@ def update_self():
 
 
 def browse(screen, projects, root, folder, error, updates):
-    curses.set_escdelay(25)
+    if hasattr(curses, "set_escdelay"):
+        curses.set_escdelay(25)
+    if os.name == "nt":
+        curses.raw()
     try:
         curses.curs_set(0)
     except curses.error:
@@ -272,6 +307,12 @@ def browse(screen, projects, root, folder, error, updates):
         for name in ("title", "accent", "err", "key"):
             C[name] |= curses.A_BOLD
 
+    def keyset(*names):
+        return {getattr(curses, name) for name in names if hasattr(curses, name)}
+
+    up, down = keyset("KEY_UP", "KEY_A2"), keyset("KEY_DOWN", "KEY_C2")
+    page_up, page_down = keyset("KEY_PPAGE", "KEY_A3"), keyset("KEY_NPAGE", "KEY_C3")
+    enter = {"\n", "\r"} | keyset("KEY_ENTER", "PADENTER")
     selected = offset = 0
     query, focus = "", None
     chats_by_folder = dict(projects)
@@ -413,7 +454,7 @@ def browse(screen, projects, root, folder, error, updates):
         subs = keep([("folder", p, str(p.relative_to(folder)), shorten(p))
                      for p in (below if query else children.get(folder, []))])
         both = bool(own and subs)
-        rows += [("label", None, f"Chats in {folder.name or '/'}", "")] * both + own
+        rows += [("label", None, f"Chats in {folder.name or folder}", "")] * both + own
         rows += [("label", None, "Folders", "")] * both + subs
         items = sum(row[0] != "label" for row in rows)
         if focus is not None:
@@ -425,12 +466,12 @@ def browse(screen, projects, root, folder, error, updates):
         inner = width - 2 * margin
         trail, step = [], folder
         while step is not None:
-            trail.append(step.name)
+            trail.append(step.name or str(step))
             step = parent_of.get(step)
         crumbs = []
         for index, name in enumerate(reversed(trail)):
             crumbs += [("  ›  ", C["accent"])] * bool(index)
-            crumbs.append((name or "/", C["title"] if index == len(trail) - 1 else C["dim"]))
+            crumbs.append((name, C["title"] if index == len(trail) - 1 else C["dim"]))
         stats = f"{count(len(children.get(folder, [])), 'folder')}  ·  {count(totals[folder][0], 'chat')}"
         if height >= 22 and width >= 64:
             top = 1 if height >= 26 else 0
@@ -514,15 +555,20 @@ def browse(screen, projects, root, folder, error, updates):
 
         key = screen.get_wch()
         error = ""
-        if key == curses.KEY_UP:
+        if key == "\x03":
+            raise KeyboardInterrupt
+        if key == curses.KEY_RESIZE:
+            if os.name == "nt":
+                curses.resize_term(0, 0)
+        elif key in up:
             selected = land(selected - 1, -1)
-        elif key == curses.KEY_DOWN:
+        elif key in down:
             selected = land(selected + 1, 1)
-        elif key == curses.KEY_PPAGE:
+        elif key in page_up:
             selected = land(selected - visible, -1)
-        elif key == curses.KEY_NPAGE:
+        elif key in page_down:
             selected = land(selected + visible, 1)
-        elif key in ("\n", "\r", curses.KEY_ENTER):
+        elif key in enter:
             if not rows:
                 continue
             kind, choice = rows[selected][:2]
@@ -549,6 +595,9 @@ def browse(screen, projects, root, folder, error, updates):
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     if sys.argv[1:] in (["--help"], ["-h"]):
         print("clm — browse local Claude Code projects and chats\n"
               "Type to search · ↑↓ move · Enter open · Esc clear / back · Ctrl-C quit\n"
@@ -559,7 +608,10 @@ def main():
     if sys.argv[1:]:
         print("Usage: clm [--update]", file=sys.stderr)
         return 2
-    claude = shutil.which("claude")
+    if curses is None:
+        print("clm needs curses. On Windows install it with: py -m pip install windows-curses", file=sys.stderr)
+        return 1
+    claude = program("claude")
     if claude is None or not (sys.stdin.isatty() and sys.stdout.isatty()):
         print("Run clm in a terminal with Claude Code on your PATH.", file=sys.stderr)
         return 1
@@ -578,13 +630,14 @@ def main():
                 return 0
             folder, chat = choice
             command = [claude, "--resume", chat.session_id] if chat else [claude]
+            previous = signal.signal(signal.SIGINT, lambda *_: None)
             try:
                 result = subprocess.run(command, cwd=folder, check=False)
                 error = f"Claude Code exited with status {result.returncode}." if result.returncode else ""
-            except KeyboardInterrupt:
-                error = ""
             except OSError as exc:
                 error = plain(str(exc))
+            finally:
+                signal.signal(signal.SIGINT, previous)
     except KeyboardInterrupt:
         return 130
     except (curses.error, OSError) as exc:

@@ -6,10 +6,13 @@
 
 ## Requirements
 
-- macOS and Python 3 with curses
+- macOS, Linux, or Windows 10/11
+- Python 3.9 or newer (on Windows the installer adds the `windows-curses` package)
 - Claude Code installed and available as `claude` on your PATH
 
 ## Install
+
+### macOS and Linux
 
 One line, no clone needed:
 
@@ -25,7 +28,27 @@ cd claude-menu
 ./install.sh
 ```
 
-Either way `clm` lands in `~/.local/bin` (set `CLM_BIN_DIR` to change that), and that folder is added to your PATH if it isn't already. Then run `clm` from anywhere. To remove it: `./install.sh --uninstall`.
+Either way `clm` lands in `~/.local/bin` (set `CLM_BIN_DIR` to change that), and that folder is added to your PATH if it isn't already. To remove it: `./install.sh --uninstall` from a clone, or `curl -fsSL https://raw.githubusercontent.com/Sl0oth/claude-menu/main/install.sh | sh -s -- --uninstall`.
+
+### Windows
+
+In PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Sl0oth/claude-menu/main/install.ps1 | iex
+```
+
+Or from a clone:
+
+```powershell
+git clone https://github.com/Sl0oth/claude-menu.git
+cd claude-menu
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+This installs `windows-curses` if needed, puts `clm` in `%LOCALAPPDATA%\clm` (set `CLM_INSTALL_DIR` to change that), and adds it to your user PATH. Open a new terminal afterwards. To remove it: `powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall` from a clone, or in PowerShell: `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Sl0oth/claude-menu/main/install.ps1))) -Uninstall`.
+
+Then run `clm` from any folder.
 
 ## Update
 
@@ -33,7 +56,7 @@ Either way `clm` lands in `~/.local/bin` (set `CLM_BIN_DIR` to change that), and
 clm --update
 ```
 
-That downloads the latest version (or runs `git pull` if you installed from a clone). About once a day clm checks for a new version in the background and shows **update available** in the status bar when there is one. Set `CLM_NO_UPDATE_CHECK=1` to turn the check off.
+That downloads the latest version (or runs `git pull` if you installed from a clone). About once a day clm checks for a new version in the background and shows **update available** in the status bar when there is one. Set `CLM_NO_UPDATE_CHECK` to any non-empty value to turn the check off.
 
 ## Use
 
