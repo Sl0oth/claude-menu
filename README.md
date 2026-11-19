@@ -7,15 +7,25 @@ CLM is a keyboard-driven terminal launcher for Claude Code. Browse local project
 - macOS and Python 3 with curses
 - Claude Code installed and available as `claude` on your PATH
 
-## Run
+## Install
 
-From this folder:
+One line, no clone needed:
 
 ```sh
-./clm
+curl -fsSL https://raw.githubusercontent.com/Sl0oth/clm/main/install.sh | sh
 ```
 
-To run `clm` from anywhere, place the executable or a symlink to it in a directory on your PATH.
+Or from a clone (updates with `git pull`):
+
+```sh
+git clone https://github.com/Sl0oth/clm.git
+cd clm
+./install.sh
+```
+
+Either way `clm` lands in `~/.local/bin` (set `CLM_BIN_DIR` to change that), and that folder is added to your PATH if it isn't already. Then run `clm` from anywhere. To remove it: `./install.sh --uninstall`.
+
+## Use
 
 - Type to search.
 - Use **↑ / ↓** to move and **Enter** to open.
