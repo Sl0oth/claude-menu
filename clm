@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import curses
+import hashlib
 import json
 import os
 import re
@@ -8,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -99,29 +101,28 @@ def read_chat(path):
     return folder, Chat(session_id, title or preview or "Untitled chat", preview, stat.st_mtime)
 
 
-def catalog():
-    home = Path.home()
-    dev = home / "Documents" / "Dev"
-    config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(home / ".claude"))).expanduser()
-    projects = {}
+def catalog(root):
+    config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))).expanduser()
+    projects = {root: {}}
     utility_folders = {".gradle", ".git", "gradle", "manifest", "manifests",
                        "build", "node_modules", "__pycache__"}
-    if dev.is_dir():
-        for folder in dev.iterdir():
+    try:
+        for folder in root.iterdir():
             if not folder.name.startswith(".") and folder.name.casefold() not in utility_folders and folder.is_dir():
                 projects[folder.resolve()] = {}
+    except OSError:
+        pass
     for transcript in (config / "projects").glob("*/*.jsonl"):
         result = read_chat(transcript)
         if result is None:
             continue
         folder, chat = result
+        if folder != root and root not in folder.parents:
+            continue
         chats = projects.setdefault(folder, {})
         previous = chats.get(chat.session_id)
         if previous is None or previous.modified < chat.modified:
             chats[chat.session_id] = chat
-    videos = (home / "Documents" / "Videos").resolve()
-    if any(videos in folder.parents for folder in projects):
-        projects.setdefault(videos, {})
     ordered = [
         (folder, sorted(chats.values(), key=lambda chat: -chat.modified))
         for folder, chats in projects.items()
@@ -173,7 +174,86 @@ def git_branch(folder):
     return head.removeprefix("ref: refs/heads/") if head.startswith("ref:") else head[:7]
 
 
-def browse(screen, projects, folder, error):
+UPDATE_URL = "https://raw.githubusercontent.com/Sl0oth/claude-menu/main/clm"
+HERE = Path(__file__).resolve()
+CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "clm" / "update.json"
+
+
+def from_git():
+    return (HERE.parent / ".git").exists()
+
+
+def fetch_latest():
+    try:
+        result = subprocess.run(["curl", "-fsSL", "--max-time", "8", UPDATE_URL],
+                                capture_output=True, check=False)
+    except OSError:
+        return None
+    body = result.stdout
+    if result.returncode or not body.startswith(b"#!") or b"python3" not in body.split(b"\n", 1)[0]:
+        return None
+    return body
+
+
+def remember(remote):
+    try:
+        CACHE.parent.mkdir(parents=True, exist_ok=True)
+        CACHE.write_text(json.dumps({"checked": time.time(), "remote": remote}))
+    except OSError:
+        pass
+
+
+def watch_for_update(state):
+    if os.environ.get("CLM_NO_UPDATE_CHECK") or from_git():
+        return
+    try:
+        local = hashlib.sha256(HERE.read_bytes()).hexdigest()
+        cache = json.loads(CACHE.read_text())
+    except (OSError, ValueError):
+        cache = {}
+    if not isinstance(cache, dict):
+        cache = {}
+    state["available"] = cache.get("remote") not in (None, local)
+    checked = cache.get("checked")
+    if isinstance(checked, (int, float)) and time.time() - checked < 86400:
+        return
+
+    def check():
+        latest = fetch_latest()
+        if latest is not None:
+            remote = hashlib.sha256(latest).hexdigest()
+            remember(remote)
+            state["available"] = remote != local
+
+    threading.Thread(target=check, daemon=True).start()
+
+
+def update_self():
+    if from_git():
+        print(f"clm runs from a git clone at {shorten(HERE.parent)}, updating with git pull.", flush=True)
+        return subprocess.run(["git", "-C", str(HERE.parent), "pull", "--ff-only"], check=False).returncode
+    latest = fetch_latest()
+    if latest is None:
+        print("Could not download the latest clm.", file=sys.stderr)
+        return 1
+    remember(hashlib.sha256(latest).hexdigest())
+    if latest == HERE.read_bytes():
+        print("clm is already up to date.")
+        return 0
+    staged = HERE.with_name(HERE.name + ".new")
+    try:
+        staged.write_bytes(latest)
+        staged.chmod(0o755)
+        os.replace(staged, HERE)
+    except OSError as exc:
+        staged.unlink(missing_ok=True)
+        print(f"Could not update {HERE}: {exc}", file=sys.stderr)
+        return 1
+    print(f"Updated {shorten(HERE)}.")
+    return 0
+
+
+def browse(screen, projects, root, folder, error, updates):
     curses.set_escdelay(25)
     try:
         curses.curs_set(0)
@@ -194,18 +274,24 @@ def browse(screen, projects, folder, error):
 
     selected = offset = 0
     query, focus = "", None
-    dev_root = (Path.home() / "Documents" / "Dev").resolve()
     chats_by_folder = dict(projects)
     parent_of = {
         project: next((parent for parent in project.parents
-                       if parent in chats_by_folder and parent != dev_root), None)
+                       if parent in chats_by_folder), None)
         for project in chats_by_folder
     }
     children = {}
     for project, parent in parent_of.items():
         children.setdefault(parent, []).append(project)
-    roots = [p for p in children.get(None, []) if chats_by_folder[p] or children.get(p)]
-    total_chats = sum(map(len, chats_by_folder.values()))
+    totals = {project: [0, None] for project in chats_by_folder}
+    for project, chats in chats_by_folder.items():
+        step = project
+        while chats and step is not None:
+            totals[step][0] += len(chats)
+            totals[step][1] = max(totals[step][1] or 0, chats[0].modified)
+            step = parent_of[step]
+    for kids in children.values():
+        kids.sort(key=lambda p: (-(totals[p][1] or 0), p.name.casefold()))
 
     def put(y, x, text, attr=None, limit=None):
         height, width = screen.getmaxyx()
@@ -239,18 +325,27 @@ def browse(screen, projects, folder, error):
     def count(n, word):
         return f"{n} {word}{'s' * (n != 1)}"
 
+    def land(index, direction):
+        index = max(0, min(len(rows) - 1, index))
+        if rows and rows[index][0] == "label":
+            index = index + direction if 0 <= index + direction < len(rows) else index - direction
+        return index
+
     def draw_row(y, x, width, row, active):
         kind, item, title, _ = row
         look = (lambda name: C["sel"]) if active else (lambda name: C[name])
         if kind == "new":
             put(y, x, "+  New chat", look("accent"))
             return
+        if kind == "label":
+            end = put(y, x, title + " ", C["dim"])
+            put(y, end, "─" * (x + width - end), C["border"])
+            return
         if kind == "folder":
-            chats = chats_by_folder[item]
-            stamp = chats[0].modified if chats else None
-            right = count(len(chats), "chat") + (f"  {ago(stamp):>3}" if stamp else "     ")
+            total, stamp = totals[item]
+            right = count(total, "chat") + (f"  {ago(stamp):>3}" if stamp else "     ")
             room = width - len(right) - 4
-            label, tone = clipped(plain(title), room - 1) + "/", "text" if chats else "dim"
+            label, tone = clipped(plain(title), room - 1) + "/", "text" if total else "dim"
         else:
             stamp, right = item.modified, ago(item.modified)
             room = width - len(right) - 4
@@ -284,9 +379,10 @@ def browse(screen, projects, folder, error):
                           *wrap(item.preview, C["text"], max(1, room - len(lines) - 2))]
             return lines, "resume this chat"
         chats, subs = chats_by_folder[item], children.get(item, [])
-        facts = [("Chats", str(len(chats)))]
-        if chats:
-            facts.append(("Last active", ago(chats[0].modified, True)))
+        nested = totals[item][0] - len(chats)
+        facts = [("Chats", str(len(chats)) + (f" here, {nested} in subfolders" if nested else ""))]
+        if totals[item][1]:
+            facts.append(("Last active", ago(totals[item][1], True)))
         if git_branch(item):
             facts.append(("Branch", git_branch(item)))
         if subs:
@@ -294,7 +390,7 @@ def browse(screen, projects, folder, error):
         lines = [[(item.name, C["title"])], [(shorten(item), C["dim"])], blank,
                  *[[(f"{name:<13}", C["dim"]), (value, C["text"])] for name, value in facts], blank]
         if not chats:
-            return lines + [[("No chats yet.", C["dim"])]], "open"
+            return lines + [[("Chats are in subfolders." if nested else "No chats yet.", C["dim"])]], "open"
         lines.append([("Recent chats", C["accent"])])
         for chat in chats:
             right = ago(chat.modified)
@@ -309,19 +405,21 @@ def browse(screen, projects, folder, error):
         if C["text"]:
             for y in range(height):
                 screen.hline(y, 0, " ", width - (y == height - 1), C["text"])
-        if folder is None:
-            candidates = chats_by_folder if query else roots
-            rows = [("folder", p, p.name, shorten(p)) for p in candidates]
-        else:
-            rows = [("new", None, "New chat", "")]
-            rows += [("folder", p, str(p.relative_to(folder)), shorten(p)) for p in children.get(folder, [])]
-            rows += [("chat", c, c.title, c.preview) for c in chats_by_folder.get(folder, [])]
+        below = [p for p in chats_by_folder if folder in p.parents]
         needle = query.casefold()
-        rows = [row for row in rows if needle in (row[2] + " " + row[3]).casefold()]
+        keep = lambda group: [row for row in group if needle in (row[2] + " " + row[3]).casefold()]
+        rows = keep([("new", None, "New chat", "")])
+        own = keep([("chat", c, c.title, c.preview) for c in chats_by_folder[folder]])
+        subs = keep([("folder", p, str(p.relative_to(folder)), shorten(p))
+                     for p in (below if query else children.get(folder, []))])
+        both = bool(own and subs)
+        rows += [("label", None, f"Chats in {folder.name or '/'}", "")] * both + own
+        rows += [("label", None, "Folders", "")] * both + subs
+        items = sum(row[0] != "label" for row in rows)
         if focus is not None:
             selected = next((i for i, row in enumerate(rows) if row[1] == focus), 0)
             focus = None
-        selected = min(selected, max(0, len(rows) - 1))
+        selected = land(selected, 1)
 
         margin = 2 if width >= 60 else 0
         inner = width - 2 * margin
@@ -329,22 +427,18 @@ def browse(screen, projects, folder, error):
         while step is not None:
             trail.append(step.name)
             step = parent_of.get(step)
-        crumbs = [("Projects", C["dim"] if trail else C["title"])]
-        for index, name in enumerate(reversed(trail), 1):
-            crumbs += [("  ›  ", C["accent"]), (name, C["title"] if index == len(trail) else C["dim"])]
-        if folder is None:
-            stats = f"{count(len(roots), 'project')}  ·  {count(total_chats, 'chat')}"
-        else:
-            stats = count(len(chats_by_folder[folder]), "chat")
-            if children.get(folder):
-                stats += "  ·  " + count(len(children[folder]), "folder")
+        crumbs = []
+        for index, name in enumerate(reversed(trail)):
+            crumbs += [("  ›  ", C["accent"])] * bool(index)
+            crumbs.append((name or "/", C["title"] if index == len(trail) - 1 else C["dim"]))
+        stats = f"{count(len(children.get(folder, [])), 'folder')}  ·  {count(totals[folder][0], 'chat')}"
         if height >= 22 and width >= 64:
             top = 1 if height >= 26 else 0
             for y, (c, l, m) in enumerate(WORDMARK, top):
                 put(y, margin + 1, f"{c:<12}{l:<11}{m}", C["accent"])
             info = margin + 38
             segments(top + 1, info, crumbs, width - info - margin)
-            put(top + 2, info, shorten(folder or dev_root), C["dim"])
+            put(top + 2, info, shorten(folder), C["dim"])
             put(top + 3, info, stats, C["dim"])
             search = top + 6
         else:
@@ -360,7 +454,7 @@ def browse(screen, projects, folder, error):
             put(search + 1, x, "▏", C["accent"])
             put(search + 1, margin + inner - 2 - len(found), found, C["dim"])
         else:
-            put(search + 1, x, "Type to search " + ("projects" if folder is None else "folders and chats"),
+            put(search + 1, x, "Type to search folders and chats",
                 C["dim"], inner - 6)
 
         top, bottom = search + 3, max(search + 5, height - 3)
@@ -369,14 +463,14 @@ def browse(screen, projects, folder, error):
         visible = bottom - top - 1
         offset = min(offset, selected, max(0, len(rows) - visible))
         offset = max(offset, selected - visible + 1)
-        box(top, margin, bottom, list_width, "Projects" if folder is None else "Chats")
+        box(top, margin, bottom, list_width, "Projects" if folder == root else "Chats")
         for index, row in enumerate(rows[offset:offset + visible], offset):
             y = top + 1 + index - offset
             if index == selected:
                 put(y, margin + 1, " " * (list_width - 2), C["sel"])
             draw_row(y, margin + 2, list_width - 4, row, index == selected)
         if not rows:
-            put(top + 1, margin + 2, "No matches" if query else "Type to find a Dev folder and start a chat",
+            put(top + 1, margin + 2, "No matches" if query else "No folders or chats here yet",
                 C["dim"], list_width - 4)
         if len(rows) > visible:
             thumb = max(1, visible * visible // len(rows))
@@ -401,27 +495,33 @@ def browse(screen, projects, folder, error):
             screen.hline(height - 1, 0, " ", width, C["bar"])
         except curses.error:
             pass
-        escape = "clear" if query else "back" if folder is not None else "quit"
+        escape = "clear" if query else "back" if folder != root else "quit"
         x = margin + 1
         hints = [("↑↓", "move"), ("⏎", "open"), ("esc", escape)] + [("^C", "quit")] * (escape != "quit")
         for key_name, label in hints:
             x = put(height - 1, x, f" {key_name} ", C["key"])
             x = put(height - 1, x, f" {label}   ", C["bar"])
+        right = width - margin - 1
         if rows:
-            position = f"{selected + 1} / {len(rows)}"
-            put(height - 1, width - margin - 1 - len(position), position, C["bar"])
+            position = f"{sum(row[0] != 'label' for row in rows[:selected + 1])} / {items}"
+            right -= len(position)
+            put(height - 1, right, position, C["bar"])
+        if updates["available"]:
+            notice = " update available · clm --update "
+            if right - len(notice) - 3 > x:
+                put(height - 1, right - len(notice) - 3, notice, C["key"])
         screen.refresh()
 
         key = screen.get_wch()
         error = ""
         if key == curses.KEY_UP:
-            selected = max(0, selected - 1)
+            selected = land(selected - 1, -1)
         elif key == curses.KEY_DOWN:
-            selected = min(max(0, len(rows) - 1), selected + 1)
+            selected = land(selected + 1, 1)
         elif key == curses.KEY_PPAGE:
-            selected = max(0, selected - visible)
+            selected = land(selected - visible, -1)
         elif key == curses.KEY_NPAGE:
-            selected = min(max(0, len(rows) - 1), selected + visible)
+            selected = land(selected + visible, 1)
         elif key in ("\n", "\r", curses.KEY_ENTER):
             if not rows:
                 continue
@@ -433,7 +533,7 @@ def browse(screen, projects, folder, error):
         elif key == "\x1b":
             if query:
                 selected, offset, query = 0, 0, ""
-            elif folder is not None:
+            elif folder != root:
                 focus, folder = folder, parent_of.get(folder)
                 offset = 0
             else:
@@ -451,20 +551,29 @@ def browse(screen, projects, folder, error):
 def main():
     if sys.argv[1:] in (["--help"], ["-h"]):
         print("clm — browse local Claude Code projects and chats\n"
-              "Type to search · ↑↓ move · Enter open · Esc clear / back · Ctrl-C quit")
+              "Type to search · ↑↓ move · Enter open · Esc clear / back · Ctrl-C quit\n"
+              "clm --update   install the latest version")
         return 0
+    if sys.argv[1:] == ["--update"]:
+        return update_self()
     if sys.argv[1:]:
-        print("Usage: clm", file=sys.stderr)
+        print("Usage: clm [--update]", file=sys.stderr)
         return 2
     claude = shutil.which("claude")
     if claude is None or not (sys.stdin.isatty() and sys.stdout.isatty()):
         print("Run clm in a terminal with Claude Code on your PATH.", file=sys.stderr)
         return 1
 
-    folder, error = None, ""
+    try:
+        root = Path.cwd().resolve()
+    except OSError:
+        root = Path.home()
+    folder, error = root, ""
+    updates = {"available": False}
+    watch_for_update(updates)
     try:
         while True:
-            choice = curses.wrapper(browse, catalog(), folder, error)
+            choice = curses.wrapper(browse, catalog(root), root, folder, error, updates)
             if choice is None:
                 return 0
             folder, chat = choice

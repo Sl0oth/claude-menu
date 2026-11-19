@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pyte
 
-CLM = Path(__file__).resolve().parent.parent / "clm"
+CLM = Path(os.environ.get("CLM_PATH") or Path(__file__).resolve().parent.parent / "clm")
 KEYS = {"UP": b"\x1bOA", "DOWN": b"\x1bOB", "PGUP": b"\x1b[5~", "PGDN": b"\x1b[6~",
         "ENTER": b"\r", "ESC": b"\x1b", "BS": b"\x7f"}
 
